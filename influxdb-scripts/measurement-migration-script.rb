@@ -1,9 +1,13 @@
 require 'influxdb'
 require 'json'
 require 'toml'
+require 'date'
 
 config = TOML.load_file('migrate.conf')
-puts config['connection']
+$flag_after_rows = config['migrate']['flag_after_rows'] || 100
+$start_from_previous_migration_date = config['migrate']['start_from_previous_migration_date']
+$flag_rows_processed = 0
+$total_rows_processed = 0
 $influxdb = InfluxDB::Client.new config['connection']['database'],
                                 host: config['connection']['host'],
                                 port: config['connection']['port'],
@@ -12,12 +16,12 @@ $influxdb = InfluxDB::Client.new config['connection']['database'],
                                 ssl_ca_cert: config['connection']['ssl_ca_cert'],
                                 retry: config['connection']['retry'],
                                 username: config['connection']['username'],
-                                password: config['connection']['password'],
-                                epoch: 's'
+                                password: config['connection']['password']
 
-def get_start_date
+def get_start_date(measurement_name)
   # Store in Date filename
-  filename = 'Date'
+  return nil unless $start_from_previous_migration_date
+  filename = "#{measurement_name}_Date"
   File.file?(filename) ? File.read(filename) : nil
 end
 
@@ -41,8 +45,9 @@ def migrate(measurement_name)
 
   # Query results
   query = "select * from #{measurement_name}"
-  start_date = get_start_date
-  query += " where time >= '#{start_date}'" if start_date
+  start_date = get_start_date(measurement_name)
+  query += " where time >= '#{start_date}'" unless start_date.nil? or start_date.empty?
+  query += " ORDER BY time ASC"
   tags = extract_tags(measurement_name)
 
   #  Format for writing
@@ -50,13 +55,14 @@ def migrate(measurement_name)
   $influxdb.query query do |_, _, points|
     points.each do |row|
       point_set = generate_custom_measurement_hash(row, migration_fields, tags)
+      p point_set
       send_to_influxdb(point_set)
+      flag_date(row['time'], "#{measurement_name}_Date")
     end
   end
-  #write to custom measurement
-  
-  #error:
-  #update date
+rescue => e
+  puts e.message
+
 end
 
 def generate_custom_measurement_hash(row, migration_fields, measurement_tags)
@@ -76,7 +82,7 @@ def generate_custom_measurement_hash(row, migration_fields, measurement_tags)
         point_set[measurement_name][:values] ||= {}
         val = is_number?(v) ? v.to_f : v
         point_set[measurement_name][:values][k] = val
-        point_set[measurement_name][:timestamp] = row['time']
+        point_set[measurement_name][:timestamp] = DateTime.parse(row['time']).strftime('%s')
       end
     end
   end
@@ -94,6 +100,16 @@ end
 def send_to_influxdb(point_set)
   point_set.keys.each do |m|
     $influxdb.write_point(m, point_set[m])
+  end
+end
+
+def flag_date(timestamp, filename)
+  $flag_rows_processed = $flag_rows_processed + 1
+  $total_rows_processed = $total_rows_processed + 1
+  if $flag_after_rows == $flag_rows_processed
+    File.open(filename, 'w') { |file| file.write(timestamp) }
+    puts "Flagged #{timestamp}"
+    $flag_rows_processed = 0
   end
 end
 
